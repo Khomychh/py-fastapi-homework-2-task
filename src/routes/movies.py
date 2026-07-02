@@ -1,7 +1,8 @@
 import math
 from typing import Annotated, TypeVar
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from pydantic import ValidationError
 from sqlalchemy import select, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,11 +34,18 @@ async def _get_or_create(db: AsyncSession, model, field_name, value):
         return instance
     instance = model(**{field_name: value})
     db.add(instance)
+
     try:
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        instance = await db.get(model, **{field_name: value})
+        result = await db.execute(
+            select(model).where(getattr(model, field_name) == value)
+        )
+        instance = result.scalar_one_or_none()
+        if instance is None:
+            raise
+
     return instance
 
 
@@ -169,7 +177,9 @@ async def delete_movie(movie_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.patch("/movies/{movie_id}/", status_code=200)
 async def update_movie(
-    movie_id: int, data: MovieUpdate, db: AsyncSession = Depends(get_db)
+    movie_id: int,
+    data: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
 ):
     db_result = await db.execute(select(MovieModel).where(MovieModel.id == movie_id))
     movie = db_result.scalars().first()
@@ -178,7 +188,12 @@ async def update_movie(
             status_code=404, detail="Movie with the given ID was not found."
         )
 
-    update_data = data.model_dump(exclude_unset=True)
+    try:
+        update_schema = MovieUpdate.model_validate(data)
+    except ValidationError:
+        raise HTTPException(status_code=400, detail="Invalid input data.")
+
+    update_data = update_schema.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(movie, key, value)
 
